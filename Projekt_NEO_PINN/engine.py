@@ -4,10 +4,11 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, RobustScaler
-
+##
 from model import NeoKeplerPINN, kepler_pinn_loss
 from visualizer import visualize_animated_neos
 
@@ -80,19 +81,19 @@ def prepare_data():
     X_train, X_temp, y_train, y_temp, idx_train, idx_temp = train_test_split(X_scaled, y_scaled, indices, test_size=0.2, random_state=42)
     X_val, X_test, y_val, y_test, idx_val, idx_test = train_test_split(X_temp, y_temp, idx_temp, test_size=0.5, random_state=42)
 
-    X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32, device=device)
-    X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
-    y_val_t = torch.tensor(y_val, dtype=torch.float32, device=device)
-    X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
+    X_train_t = torch.tensor(X_train, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32)
+    X_val_t = torch.tensor(X_val, dtype=torch.float32)
+    y_val_t = torch.tensor(y_val, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32)
 
     X_train_real = scaler_X.inverse_transform(X_train)
-    e_train_real = torch.tensor(X_train_real[:, 1], dtype=torch.float32, device=device)
-    a_train_real = torch.tensor(np.expm1(X_train_real[:, 2]), dtype=torch.float32, device=device) 
+    e_train_real = torch.tensor(X_train_real[:, 1], dtype=torch.float32)
+    a_train_real = torch.tensor(np.expm1(X_train_real[:, 2]), dtype=torch.float32) 
     
     X_val_real = scaler_X.inverse_transform(X_val)
-    e_val_real = torch.tensor(X_val_real[:, 1], dtype=torch.float32, device=device)
-    a_val_real = torch.tensor(np.expm1(X_val_real[:, 2]), dtype=torch.float32, device=device)
+    e_val_real = torch.tensor(X_val_real[:, 1], dtype=torch.float32)
+    a_val_real = torch.tensor(np.expm1(X_val_real[:, 2]), dtype=torch.float32)
 
     return {
         'device': device, 'df': df, 'features_cols': features_cols,
@@ -102,12 +103,16 @@ def prepare_data():
         'test': (X_test_t, y_test, idx_test)
     }
 
-def train_model(data, epochs=5000, patience=30):
-    """Trenuje model PINN i zapisuje najlepsze wagi."""
+def train_model(data, epochs=5000, patience=30, batch_size=4096):
+    """Trenuje model PINN z użyciem DataLoadera i zapisuje najlepsze wagi."""
     device = data['device']
     X_train_t, y_train_t, a_train_real, e_train_real = data['train']
     X_val_t, y_val_t, a_val_real, e_val_real = data['val']
     scaler_y = data['scaler_y']
+
+    # Tworzymy Dataset i DataLoader (Standard w projektach ML)
+    train_dataset = TensorDataset(X_train_t, y_train_t, a_train_real, e_train_real)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     model = NeoKeplerPINN(input_size=len(data['features_cols'])).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.005)
@@ -117,19 +122,52 @@ def train_model(data, epochs=5000, patience=30):
     best_val_loss = float('inf')
     patience_counter = 0
 
-    print(f"\n--- PINN Training Start on {device} ---")
+    print(f"\n--- PINN Training Start on {device} (Batch: {batch_size}) ---")
+    
+    #  Pobieramy całkowitą liczbę paczek w jednej epoce
+    total_batches = len(train_loader)
+
     for epoch in range(epochs):
         model.train()
-        optimizer.zero_grad()
-        y_pred_train = model(X_train_t)
-        loss_train, _, _ = kepler_pinn_loss(y_pred_train, y_train_t, a_train_real, e_train_real, scaler_y, lambda_physics=0.5)
-        loss_train.backward()
-        optimizer.step()
+        train_loss_sum = 0.0
         
+        # Używamy enumerate, aby dostać numer aktualnej paczki (batch_idx)
+        for batch_idx, (batch_X, batch_y, batch_a, batch_e) in enumerate(train_loader, 1):
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            batch_a, batch_e = batch_a.to(device), batch_e.to(device)
+
+            optimizer.zero_grad()
+            y_pred_batch = model(batch_X)
+            
+            loss_batch, _, _ = kepler_pinn_loss(
+                y_pred_batch, batch_y, batch_a, batch_e, scaler_y, lambda_physics=0.5
+            )
+            
+            loss_batch.backward()
+            optimizer.step()
+            train_loss_sum += loss_batch.item() * batch_X.size(0)
+            
+            #  Dynamiczny print - \r cofa kursor na początek linii, end="" zapobiega przejściu do nowej linii
+            print(f"\r Epoch [{epoch+1}/{epochs}] | Batch: {batch_idx}/{total_batches}", end="")
+            
+        #  Po przerobieniu wszystkich paczek w epoce, czyścimy tę roboczą linijkę
+        print("\r" + " " * 80 + "\r", end="")
+        
+        epoch_train_loss = train_loss_sum / len(train_dataset)
+        
+        # Walidacja
         model.eval()
         with torch.no_grad():
-            y_pred_val = model(X_val_t)
-            loss_val, _, _ = kepler_pinn_loss(y_pred_val, y_val_t, a_val_real, e_val_real, scaler_y, lambda_physics=0.5)
+            # Przesyłamy zbiór walidacyjny na device tylko na czas oceny
+            X_val_dev = X_val_t.to(device)
+            y_val_dev = y_val_t.to(device)
+            a_val_dev = a_val_real.to(device)
+            e_val_dev = e_val_real.to(device)
+
+            y_pred_val = model(X_val_dev)
+            loss_val, _, _ = kepler_pinn_loss(
+                y_pred_val, y_val_dev, a_val_dev, e_val_dev, scaler_y, lambda_physics=0.5
+            )
         
         current_val_loss = loss_val.item()
         scheduler.step(current_val_loss)
@@ -148,9 +186,9 @@ def train_model(data, epochs=5000, patience=30):
         if (epoch + 1) % 50 == 0:
             with torch.no_grad():
                 y_pred_val_real = scaler_y.inverse_transform(y_pred_val[:, [0]].cpu().numpy())
-                y_true_val_real = scaler_y.inverse_transform(y_val_t.cpu().numpy())
+                y_true_val_real = scaler_y.inverse_transform(y_val_dev.cpu().numpy())
                 mae_moid = np.mean(np.abs(y_pred_val_real[:, 0] - y_true_val_real[:, 0]))
-            print(f"Epoch [{epoch+1}/{epochs}] | Val Loss: {current_val_loss:.4f} | MOID Error (MAE): {mae_moid:.2f} LD")
+            print(f"Epoch [{epoch+1}/{epochs}] | Train Loss: {epoch_train_loss:.4f} | Val Loss: {current_val_loss:.4f} | MOID Error (MAE): {mae_moid:.2f} LD")
     
     print("Training Complete! Model saved.")
 
@@ -169,7 +207,7 @@ def evaluate_model(data):
     model.eval()
     
     with torch.no_grad():
-        y_pred_test = model(X_test_t)
+        y_pred_test = model(X_test_t.to(device))
         y_pred_real_moid = scaler_y.inverse_transform(y_pred_test[:, [0]].cpu().numpy())
         y_true_test_real_moid = scaler_y.inverse_transform(y_test)
         
@@ -195,7 +233,7 @@ def generate_visualization(data, top_n=10):
     model.eval()
 
     with torch.no_grad():
-        y_pred_test = model(X_test_t)
+        y_pred_test = model(X_test_t.to(device))
         y_pred_real_moid = scaler_y.inverse_transform(y_pred_test[:, [0]].cpu().numpy())
 
     sorted_indices = np.argsort(np.abs(y_pred_real_moid[:, 0]))
